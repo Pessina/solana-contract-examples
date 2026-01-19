@@ -1,5 +1,4 @@
 import { PublicKey } from '@solana/web3.js';
-import { ethers } from 'ethers';
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 
 import type { TokenBalance } from '@/lib/types/token.types';
@@ -8,10 +7,11 @@ import {
   getAllErc20Tokens,
   NETWORKS_WITH_TOKENS,
 } from '@/lib/constants/token-metadata';
-import type { BridgeContract } from '@/lib/contracts/bridge-contract';
-import { getTokenInfo } from '@/lib/utils/token-formatting';
+import type { DexContract } from '@/lib/contracts/dex-contract';
 import { getRPCManager } from '@/lib/utils/rpc-manager';
 import { getAlchemyProvider } from '@/lib/rpc';
+
+const decimalsCache = new Map<string, number>();
 
 /**
  * TokenBalanceService handles all token balance operations including
@@ -23,18 +23,29 @@ export class TokenBalanceService {
   private alchemy = getAlchemyProvider();
   private rpcManager: ReturnType<typeof getRPCManager>;
 
-  constructor(private bridgeContract: BridgeContract) {
-    this.rpcManager = getRPCManager(bridgeContract.getConnection());
+  constructor(private dexContract: DexContract) {
+    this.rpcManager = getRPCManager(dexContract.getConnection());
   }
 
-  // Decimals resolution delegated to shared token info (Alchemy-backed)
   private async resolveDecimals(erc20Address: string): Promise<number> {
+    const normalized = erc20Address.toLowerCase();
+    const cached = decimalsCache.get(normalized);
+    if (cached !== undefined) return cached;
+
+    const localMeta = getTokenMetadata(erc20Address);
+    if (localMeta) {
+      decimalsCache.set(normalized, localMeta.decimals);
+      return localMeta.decimals;
+    }
+
     try {
-      const info = await getTokenInfo(erc20Address);
-      return info.decimals;
+      const meta = await this.alchemy.core.getTokenMetadata(erc20Address);
+      const decimals = meta?.decimals ?? 18;
+      decimalsCache.set(normalized, decimals);
+      return decimals;
     } catch {
-      const tokenMetadata = getTokenMetadata(erc20Address);
-      return tokenMetadata?.decimals || 18;
+      decimalsCache.set(normalized, 18);
+      return 18;
     }
   }
 
@@ -65,24 +76,12 @@ export class TokenBalanceService {
       for (const tokenBalance of balances.tokenBalances) {
         const balance = BigInt(tokenBalance.tokenBalance || '0');
 
-        if (balance > BigInt(0)) {
-          // Only fetch decimals for non-zero balances
-          const decimals = await this.resolveDecimals(
-            tokenBalance.contractAddress,
-          );
-          results.push({
-            address: tokenBalance.contractAddress,
-            balance,
-            decimals,
-          });
-        } else {
-          // Include zero balances with default decimals
-          results.push({
-            address: tokenBalance.contractAddress,
-            balance: BigInt(0),
-            decimals: 18,
-          });
-        }
+        const decimals = await this.resolveDecimals(tokenBalance.contractAddress);
+        results.push({
+          address: tokenBalance.contractAddress,
+          balance,
+          decimals,
+        });
       }
 
       return results;
@@ -109,12 +108,8 @@ export class TokenBalanceService {
         const balance = tokenBalances?.tokenBalances?.[0]?.tokenBalance || '0';
         const balanceBigInt = BigInt(balance || '0');
 
-        if (balanceBigInt > BigInt(0)) {
-          const decimals = await this.resolveDecimals(tokenAddress);
-          return { address: tokenAddress, balance: balanceBigInt, decimals };
-        } else {
-          return { address: tokenAddress, balance: BigInt(0), decimals: 18 };
-        }
+        const decimals = await this.resolveDecimals(tokenAddress);
+        return { address: tokenAddress, balance: balanceBigInt, decimals };
       } catch (error) {
         console.error(`Error fetching balance for ${tokenAddress}:`, error);
         return { address: tokenAddress, balance: BigInt(0), decimals: 18 };
@@ -171,20 +166,19 @@ export class TokenBalanceService {
 
       // Fetch ERC20 balances from the bridge contract
       const balancesPromises = tokenAddresses.map(async erc20Address => {
-        const balance = await this.bridgeContract.fetchUserBalance(
+        const balance = await this.dexContract.fetchUserBalance(
           publicKey,
           erc20Address,
         );
         if (balance !== '0') {
-          const decimals = await this.resolveDecimals(erc20Address);
           const tokenMetadata = getTokenMetadata(erc20Address);
           return {
             erc20Address,
             amount: balance,
-            decimals,
-            symbol: tokenMetadata?.symbol || 'Unknown',
-            name: tokenMetadata?.name || 'Unknown Token',
-            chain: tokenMetadata?.chain || 'ethereum',
+            decimals: 18, // Solana contract stores all ERC20 balances with 18 decimals
+            symbol: tokenMetadata?.symbol ?? 'Unknown',
+            name: tokenMetadata?.name ?? 'Unknown Token',
+            chain: tokenMetadata?.chain ?? 'ethereum',
           };
         }
         return null;
@@ -230,9 +224,10 @@ export class TokenBalanceService {
 
           for (let i = 0; i < accounts.length; i++) {
             const account = accounts[i];
-            const ataAddress = ataAddresses[i].toBase58();
+            const ata = ataAddresses[i];
+            if (!ata) continue;
+            const ataAddress = ata.toBase58();
             const tokenInfo = tokenInfoMap.get(ataAddress);
-
             if (!tokenInfo) continue;
 
             let amount = '0';
@@ -291,78 +286,4 @@ export class TokenBalanceService {
     }
   }
 
-  /**
-   * Fetch single user balance from Solana contract
-   */
-  async fetchUserBalance(
-    publicKey: PublicKey,
-    erc20Address: string,
-  ): Promise<string> {
-    return await this.bridgeContract.fetchUserBalance(publicKey, erc20Address);
-  }
-
-  /**
-   * Get available balance for a specific token, adjusted for contract constraints
-   * Returns both the formatted amount and the actual decimals used
-   */
-  async getAdjustedAvailableBalance(
-    derivedAddress: string,
-    erc20Address: string,
-  ): Promise<{ amount: string; decimals: number }> {
-    const unclaimedBalances = await this.fetchUnclaimedBalances(derivedAddress);
-
-    const tokenBalance = unclaimedBalances.find(
-      balance =>
-        balance.erc20Address.toLowerCase() === erc20Address.toLowerCase(),
-    );
-
-    if (!tokenBalance || !tokenBalance.amount || tokenBalance.amount === '0') {
-      throw new Error(
-        `No ${erc20Address} tokens available in the derived address`,
-      );
-    }
-
-    // Apply random subtraction to work around contract constraints
-    const balance = BigInt(tokenBalance.amount);
-    const randomSubtraction = BigInt(Math.floor(Math.random() * 1000) + 1);
-    const adjustedBalance = balance - randomSubtraction;
-
-    // Ensure we don't go negative
-    const finalBalance =
-      adjustedBalance > BigInt(0) ? adjustedBalance : BigInt(1);
-
-    // Convert to decimal format using the actual contract decimals
-    const balanceInUnits = ethers.formatUnits(
-      finalBalance,
-      tokenBalance.decimals,
-    );
-
-    return {
-      amount: balanceInUnits,
-      decimals: tokenBalance.decimals,
-    };
-  }
-
-  /**
-   * Get available balance for a specific token using public key
-   * This is a convenience method that derives the address first
-   */
-  async getAdjustedAvailableBalanceByPublicKey(
-    publicKey: PublicKey,
-    erc20Address: string,
-    vaultAuthority: PublicKey,
-    basePublicKey: string,
-  ): Promise<{ amount: string; decimals: number }> {
-    // Import here to avoid circular dependency
-    const { deriveEthereumAddress } = await import('@/lib/constants/addresses');
-
-    const path = publicKey.toString();
-    const derivedAddress = deriveEthereumAddress(
-      path,
-      vaultAuthority.toString(),
-      basePublicKey,
-    );
-
-    return this.getAdjustedAvailableBalance(derivedAddress, erc20Address);
-  }
 }

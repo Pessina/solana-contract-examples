@@ -3,28 +3,17 @@ use alloy_sol_types::SolCall;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::keccak;
 use anchor_lang::solana_program::secp256k1_recover::secp256k1_recover;
-use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use chain_signatures::cpi::accounts::SignRespond;
-use chain_signatures::cpi::sign_respond;
-use chain_signatures::SerializationFormat;
+use borsh::BorshDeserialize;
+use chain_signatures::cpi::accounts::SignBidirectional;
+use chain_signatures::cpi::sign_bidirectional;
 
-use signet_rs::evm::EVMTransactionBuilder;
+use signet_rs::{TransactionBuilder, TxBuilder, EVM};
 
-use crate::state::transaction_status::{TransactionRecord, TransactionStatus, TransactionType};
-use crate::state::vault::{EvmTransactionParams, IERC20};
-use crate::{ClaimErc20, CompleteWithdrawErc20, DepositErc20, WithdrawErc20};
+use crate::contexts::{ClaimErc20, CompleteWithdrawErc20, DepositErc20, WithdrawErc20};
+use crate::state::{EvmTransactionParams, IERC20};
+use crate::state::{TransactionRecord, TransactionStatus, TransactionType};
 
 const HARDCODED_ROOT_PATH: &str = "root";
-
-#[derive(BorshSerialize, BorshDeserialize, BorshSchema)]
-pub struct NonFunctionCallResult {
-    pub message: String,
-}
-
-#[derive(BorshSerialize, BorshDeserialize, BorshSchema)]
-pub struct Erc20TransferResult {
-    pub success: bool,
-}
 
 pub fn deposit_erc20(
     ctx: Context<DepositErc20>,
@@ -36,7 +25,7 @@ pub fn deposit_erc20(
     tx_params: EvmTransactionParams,
 ) -> Result<()> {
     let path = requester.to_string();
-
+    // SECURITY: recipient_address should eventually be derived on-chain instead of supplied.
     // Create ERC20 transfer call
     let recipient = Address::from_slice(&recipient_address);
     let call = IERC20::transferCall {
@@ -45,62 +34,33 @@ pub fn deposit_erc20(
     };
 
     // Build EVM transaction
+    let evm_tx = TransactionBuilder::new::<EVM>()
+        .chain_id(tx_params.chain_id)
+        .nonce(tx_params.nonce)
+        .to(erc20_address)
+        .value(tx_params.value)
+        .input(call.abi_encode())
+        .gas_limit(tx_params.gas_limit)
+        .max_fee_per_gas(tx_params.max_fee_per_gas)
+        .max_priority_fee_per_gas(tx_params.max_priority_fee_per_gas)
+        .build();
 
-    msg!("Deposit: EVMTransactionBuilder::build_and_encode");
-    msg!("Chain ID: {}", tx_params.chain_id);
-    msg!("Nonce: {}", tx_params.nonce);
-    msg!("ERC20 address: {:?}", erc20_address);
-    msg!("Value: {}", tx_params.value);
-    msg!("Gas limit: {}", tx_params.gas_limit);
-    msg!("Max fee per gas: {}", tx_params.max_fee_per_gas);
-    msg!(
-        "Max priority fee per gas: {}",
-        tx_params.max_priority_fee_per_gas
-    );
-    msg!("Call data: {:?}", call.abi_encode());
+    let rlp_encoded_tx = evm_tx.build_for_signing();
 
-    let rlp_encoded_tx = EVMTransactionBuilder::build_and_encode(
-        tx_params.chain_id,
-        tx_params.nonce,
-        Some(erc20_address),
-        tx_params.value,
-        call.abi_encode(),
-        tx_params.gas_limit,
-        tx_params.max_fee_per_gas,
-        tx_params.max_priority_fee_per_gas,
-        None,
-    );
-
-    // Add detailed logging
-    msg!("=== REQUEST ID CALCULATION DEBUG ===");
-    msg!("Sender (requester): {}", ctx.accounts.requester_pda.key());
-    msg!("Transaction data length: {}", rlp_encoded_tx.len());
-    msg!(
-        "Transaction data (first 32 bytes): {:?}",
-        &rlp_encoded_tx[..32.min(rlp_encoded_tx.len())]
-    );
-    msg!("SLIP44 chain ID: {}", 60);
-    msg!("Key version: {}", 0);
-    msg!("Path: {}", path);
-    msg!("Algo: {}", "ECDSA");
-    msg!("Dest: {}", "ethereum");
-    msg!("Params: {}", "");
+    // Generate CAIP-2 ID from chain ID
+    let caip2_id = format!("eip155:{}", tx_params.chain_id);
 
     // Generate request ID and verify it matches the one passed in
-    let computed_request_id = generate_sign_respond_request_id(
+    let computed_request_id = generate_sign_bidirectional_request_id(
         &ctx.accounts.requester_pda.key(),
         &rlp_encoded_tx,
-        60, // Ethereum SLIP-44
-        0,  // key_version
+        &caip2_id,
+        1, // key_version
         &path,
         "ECDSA",
         "ethereum",
         "",
     );
-
-    msg!("Computed request ID: {:?}", computed_request_id);
-    msg!("Provided request ID: {:?}", request_id);
-    msg!("Request IDs match: {}", computed_request_id == request_id);
 
     require!(
         computed_request_id == request_id,
@@ -139,7 +99,7 @@ pub fn deposit_erc20(
 
     let cpi_ctx = CpiContext::new_with_signer(
         ctx.accounts.chain_signatures_program.to_account_info(),
-        SignRespond {
+        SignBidirectional {
             program_state: ctx.accounts.chain_signatures_state.to_account_info(),
             requester: ctx.accounts.requester_pda.to_account_info(),
             fee_payer: ctx
@@ -159,18 +119,17 @@ pub fn deposit_erc20(
         signer_seeds,
     );
 
-    sign_respond(
+    sign_bidirectional(
         cpi_ctx,
         rlp_encoded_tx,
-        60, // Ethereum SLIP-44
-        0,  // key_version
+        caip2_id,
+        1, // key_version
         path,
         "ECDSA".to_string(),
         "ethereum".to_string(),
         "".to_string(),
-        SerializationFormat::AbiJson,
+        crate::ID,
         explorer_schema,
-        SerializationFormat::Borsh,
         callback_schema,
     )?;
 
@@ -203,18 +162,20 @@ pub fn claim_erc20(
     ethereum_tx_hash: Option<[u8; 32]>,
 ) -> Result<()> {
     let pending = &ctx.accounts.pending_deposit;
+    let config = &ctx.accounts.config;
+
+    // Derive the expected address on-chain from MPC root public key + user's derivation path
+    let expected_address_bytes = crate::crypto::derive_deposit_expected_address(
+        &config.mpc_root_public_key,
+        &pending.requester,
+    )?;
 
     // Verify signature
     let message_hash = hash_message(&request_id, &serialized_output);
 
     // Verify the signature
-    let expected_address = format!(
-        "0x{}",
-        hex::encode(ctx.accounts.config.mpc_root_signer_address)
-    );
+    let expected_address = format!("0x{}", hex::encode(expected_address_bytes));
     verify_signature_from_address(&message_hash, &signature, &expected_address)?;
-
-    msg!("Signature verified successfully");
 
     // Deserialize directly as bool (server now sends just the boolean)
     let success: bool = BorshDeserialize::try_from_slice(&serialized_output)
@@ -228,11 +189,6 @@ pub fn claim_erc20(
         .amount
         .checked_add(pending.amount)
         .ok_or(crate::error::ErrorCode::Overflow)?;
-
-    msg!(
-        "ERC20 deposit claimed successfully. New balance: {}",
-        balance.amount
-    );
 
     // Update transaction history to mark deposit as completed
     let history = &mut ctx.accounts.transaction_history;
@@ -268,8 +224,6 @@ pub fn withdraw_erc20(
         .checked_sub(amount)
         .ok_or(crate::error::ErrorCode::Underflow)?;
 
-    msg!("Optimistically decremented balance by {}", amount);
-
     // Create ERC20 transfer call
     let recipient = Address::from_slice(&recipient_address);
     let call = IERC20::transferCall {
@@ -277,46 +231,34 @@ pub fn withdraw_erc20(
         amount: U256::from(amount),
     };
 
-    msg!("Withdraw: EVMTransactionBuilder::build_and_encode");
-    msg!("Chain ID: {}", tx_params.chain_id);
-    msg!("Nonce: {}", tx_params.nonce);
-    msg!("ERC20 address: {:?}", erc20_address);
-    msg!("Value: {}", tx_params.value);
-    msg!("Gas limit: {}", tx_params.gas_limit);
-    msg!("Max fee per gas: {}", tx_params.max_fee_per_gas);
-    msg!(
-        "Max priority fee per gas: {}",
-        tx_params.max_priority_fee_per_gas
-    );
-    msg!("Call data: {:?}", call.abi_encode());
-
     // Build EVM transaction - note: this is FROM the hardcoded recipient address
-    let rlp_encoded_tx = EVMTransactionBuilder::build_and_encode(
-        tx_params.chain_id,
-        tx_params.nonce,
-        Some(erc20_address),
-        tx_params.value,
-        call.abi_encode(),
-        tx_params.gas_limit,
-        tx_params.max_fee_per_gas,
-        tx_params.max_priority_fee_per_gas,
-        None,
-    );
+    let evm_tx = TransactionBuilder::new::<EVM>()
+        .chain_id(tx_params.chain_id)
+        .nonce(tx_params.nonce)
+        .to(erc20_address)
+        .value(tx_params.value)
+        .input(call.abi_encode())
+        .gas_limit(tx_params.gas_limit)
+        .max_fee_per_gas(tx_params.max_fee_per_gas)
+        .max_priority_fee_per_gas(tx_params.max_priority_fee_per_gas)
+        .build();
+
+    let rlp_encoded_tx = evm_tx.build_for_signing();
+
+    // Generate CAIP-2 ID from chain ID
+    let caip2_id = format!("eip155:{}", tx_params.chain_id);
 
     // Generate request ID
-    let computed_request_id = generate_sign_respond_request_id(
+    let computed_request_id = generate_sign_bidirectional_request_id(
         &ctx.accounts.requester.key(),
         &rlp_encoded_tx,
-        60, // Ethereum SLIP-44
-        0,  // key_version
+        &caip2_id,
+        1, // key_version
         &path,
         "ECDSA",
         "ethereum",
         "",
     );
-
-    msg!("Computed request ID: {:?}", computed_request_id);
-    msg!("Provided request ID: {:?}", request_id);
 
     require!(
         computed_request_id == request_id,
@@ -354,7 +296,7 @@ pub fn withdraw_erc20(
 
     let cpi_ctx = CpiContext::new_with_signer(
         ctx.accounts.chain_signatures_program.to_account_info(),
-        SignRespond {
+        SignBidirectional {
             program_state: ctx.accounts.chain_signatures_state.to_account_info(),
             requester: ctx.accounts.requester.to_account_info(),
             fee_payer: ctx
@@ -374,18 +316,17 @@ pub fn withdraw_erc20(
         signer_seeds,
     );
 
-    sign_respond(
+    sign_bidirectional(
         cpi_ctx,
         rlp_encoded_tx,
-        60, // Ethereum SLIP-44
-        0,  // key_version
+        caip2_id,
+        1, // key_version
         path,
         "ECDSA".to_string(),
         "ethereum".to_string(),
         "".to_string(),
-        SerializationFormat::AbiJson,
+        crate::ID,
         explorer_schema,
-        SerializationFormat::Borsh,
         callback_schema,
     )?;
 
@@ -421,13 +362,18 @@ pub fn complete_withdraw_erc20(
     ethereum_tx_hash: Option<[u8; 32]>,
 ) -> Result<()> {
     let pending = &ctx.accounts.pending_withdrawal;
+    let config = &ctx.accounts.config;
 
-    // Verify signature
+    // Derive the expected address on-chain from MPC root public key + "root" path
+    // For withdrawals, the signer is always the global vault address
+    let expected_address_bytes = crate::crypto::derive_withdrawal_expected_address(
+        &config.mpc_root_public_key,
+    )?;
+
     let message_hash = hash_message(&request_id, &serialized_output);
-    let expected_address = format!(
-        "0x{}",
-        hex::encode(ctx.accounts.config.mpc_root_signer_address)
-    );
+    // Verify the signature
+    let expected_address = format!("0x{}", hex::encode(expected_address_bytes));
+
     verify_signature_from_address(&message_hash, &signature, &expected_address)?;
 
     msg!("Signature verified successfully");
@@ -435,7 +381,7 @@ pub fn complete_withdraw_erc20(
     // Check for error magic prefix
     const ERROR_PREFIX: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
-    let should_refund = if serialized_output.len() >= 4 && &serialized_output[..4] == ERROR_PREFIX {
+    let should_refund = if serialized_output.len() >= 4 && serialized_output[..4] == ERROR_PREFIX {
         msg!("Detected error response (magic prefix)");
         true // Always refund on error
     } else {
@@ -529,10 +475,11 @@ fn verify_signature_from_address(
 
 // Helper functions
 
-fn generate_sign_respond_request_id(
+#[allow(clippy::too_many_arguments)]
+fn generate_sign_bidirectional_request_id(
     sender: &Pubkey,
     transaction_data: &[u8],
-    slip44_chain_id: u32,
+    caip2_id: &str,
     key_version: u32,
     path: &str,
     algo: &str,
@@ -541,14 +488,10 @@ fn generate_sign_respond_request_id(
 ) -> [u8; 32] {
     use alloy_sol_types::SolValue;
 
-    msg!("=== generate_sign_respond_request_id ===");
-    msg!("Encoding with abi_encode_packed");
-
-    // Match TypeScript implementation using ABI encoding
     let encoded = (
         sender.to_string(),
         transaction_data,
-        slip44_chain_id,
+        caip2_id,
         key_version,
         path,
         algo,
@@ -557,16 +500,7 @@ fn generate_sign_respond_request_id(
     )
         .abi_encode_packed();
 
-    msg!("Encoded data length: {}", encoded.len());
-    msg!(
-        "Encoded data (first 32 bytes): {:?}",
-        &encoded[..32.min(encoded.len())]
-    );
-
-    let hash = keccak::hash(&encoded).to_bytes();
-    msg!("Resulting hash: {:?}", hash);
-
-    hash
+    keccak::hash(&encoded).to_bytes()
 }
 
 fn hash_message(request_id: &[u8; 32], serialized_output: &[u8]) -> [u8; 32] {

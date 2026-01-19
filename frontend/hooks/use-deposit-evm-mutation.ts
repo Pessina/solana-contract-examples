@@ -1,23 +1,20 @@
 'use client';
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useWallet } from '@solana/wallet-adapter-react';
-import { useMemo } from 'react';
+import { useWallet } from '@solana/connector/react';
 
-import { queryKeys } from '@/lib/query-client';
+import { queryKeys, invalidateDepositQueries } from '@/lib/query-client';
 import { DepositService } from '@/lib/services/deposit-service';
+import type { StatusCallback } from '@/lib/types/shared.types';
 
-import { useBridgeContract } from './use-bridge-contract';
+import { useSolanaPublicKey } from './use-solana-public-key';
+
+const depositService = new DepositService();
 
 export function useDepositEvmMutation() {
-  const { publicKey } = useWallet();
-  const bridgeContract = useBridgeContract();
+  const { account } = useWallet();
   const queryClient = useQueryClient();
-
-  const depositService = useMemo(() => {
-    if (!bridgeContract) return null;
-    return new DepositService(bridgeContract);
-  }, [bridgeContract]);
+  const publicKey = useSolanaPublicKey();
 
   return useMutation({
     mutationFn: async ({
@@ -29,15 +26,9 @@ export function useDepositEvmMutation() {
       erc20Address: string;
       amount: string;
       decimals: number;
-      onStatusChange?: (status: {
-        status: string;
-        txHash?: string;
-        note?: string;
-        error?: string;
-      }) => void;
+      onStatusChange?: StatusCallback;
     }) => {
       if (!publicKey) throw new Error('No public key available');
-      if (!depositService) throw new Error('Deposit service not available');
       return depositService.depositErc20(
         publicKey,
         erc20Address,
@@ -47,24 +38,22 @@ export function useDepositEvmMutation() {
       );
     },
     onSuccess: () => {
-      if (publicKey) {
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.userBalances(publicKey.toString()),
-        });
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.unclaimedBalances(publicKey.toString()),
-        });
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.incomingDeposits(publicKey.toString()),
-        });
+      if (account) {
+        invalidateDepositQueries(queryClient, account);
       }
     },
-    onError: error => {
+    onError: (error, variables) => {
       console.error('Deposit EVM mutation failed:', error);
+      if (variables.onStatusChange) {
+        variables.onStatusChange({
+          status: 'failed',
+          error: error instanceof Error ? error.message : 'Deposit failed',
+        });
+      }
 
-      if (publicKey) {
+      if (account) {
         queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.incomingDeposits(publicKey.toString()),
+          queryKey: queryKeys.solana.incomingDeposits(account),
         });
       }
     },

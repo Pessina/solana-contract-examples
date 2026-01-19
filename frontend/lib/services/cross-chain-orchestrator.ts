@@ -1,15 +1,15 @@
 import { Connection } from '@solana/web3.js';
 import { Wallet } from '@coral-xyz/anchor';
-import { ethers } from 'ethers';
+import { type Hex, type PublicClient } from 'viem';
 
-import { BridgeContract } from '@/lib/contracts/bridge-contract';
+import { DexContract } from '@/lib/contracts/dex-contract';
 import { ChainSignaturesContract } from '@/lib/contracts/chain-signatures-contract';
 import type {
   EventPromises,
-  ReadRespondedEvent,
+  RespondBidirectionalEvent,
 } from '@/lib/types/chain-signatures.types';
 import type { EvmTransactionRequest } from '@/lib/types/shared.types';
-import { retryWithBackoff } from '@/lib/utils/retry';
+import { submitWithRetry } from '@/lib/evm/tx-submitter';
 
 export interface CrossChainConfig {
   eventTimeoutMs?: number;
@@ -24,25 +24,25 @@ export interface CrossChainResult {
 }
 
 export class CrossChainOrchestrator {
-  private bridgeContract: BridgeContract;
+  private dexContract: DexContract;
   private chainSignaturesContract: ChainSignaturesContract;
-  private provider: ethers.JsonRpcProvider;
+  private client: PublicClient;
   private config: Required<CrossChainConfig>;
 
   constructor(
     connection: Connection,
     wallet: Wallet,
-    provider: ethers.JsonRpcProvider,
+    client: PublicClient,
     config: CrossChainConfig = {},
     eventConnection?: Connection,
   ) {
-    this.bridgeContract = new BridgeContract(connection, wallet);
+    this.dexContract = new DexContract(connection, wallet);
     this.chainSignaturesContract = new ChainSignaturesContract(
       connection,
       wallet,
       eventConnection,
     );
-    this.provider = provider;
+    this.client = client;
 
     this.config = {
       // When eventTimeoutMs <= 0, we will wait indefinitely for events
@@ -56,7 +56,7 @@ export class CrossChainOrchestrator {
     requestId: string,
     ethereumTxParams: EvmTransactionRequest,
     solanaCompletionFn: (
-      readEvent: ReadRespondedEvent,
+      respondBidirectionalEvent: RespondBidirectionalEvent,
       ethereumTxHash?: string,
     ) => Promise<T>,
     initialSolanaFn?: () => Promise<string>,
@@ -90,10 +90,10 @@ export class CrossChainOrchestrator {
 
       // Phase 3: Wait for read response and complete on Solana
       console.log(`[${op}] Waiting for read response...`);
-      const readEvent = await this.waitForReadResponse(eventPromises);
+      const respondBidirectionalEvent = await this.waitForRespondBidirectional(eventPromises);
 
       console.log(`[${op}] Completing on Solana...`);
-      const solanaResult = await solanaCompletionFn(readEvent, ethereumTxHash);
+      const solanaResult = await solanaCompletionFn(respondBidirectionalEvent, ethereumTxHash);
 
       console.log(`[${op}] Flow completed successfully`);
 
@@ -105,6 +105,9 @@ export class CrossChainOrchestrator {
       };
     } catch (error) {
       console.error(error);
+      if (error && typeof error === 'object' && 'logs' in error) {
+        console.error(`[${op}] Transaction logs:`, (error as { logs: string[] }).logs);
+      }
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error';
       console.error(`[${op}] Flow failed:`, errorMessage);
@@ -138,7 +141,7 @@ export class CrossChainOrchestrator {
       `Signature event timeout for ${op}`,
     ).finally(() => clearTimeout(signatureBackfillTimeout));
 
-    console.log(`[${op}] Signature received`);
+    console.log(`[${op}] Signature received:`, JSON.stringify(signatureEvent.signature));
 
     const ethereumSignature = ChainSignaturesContract.extractSignature(
       signatureEvent.signature,
@@ -146,40 +149,32 @@ export class CrossChainOrchestrator {
 
     console.log(`[${op}] Submitting to Ethereum...`);
 
-    const signedTx = ethers.Transaction.from({
-      type: txParams.type,
-      chainId: txParams.chainId,
-      nonce: txParams.nonce,
-      maxPriorityFeePerGas: txParams.maxPriorityFeePerGas,
-      maxFeePerGas: txParams.maxFeePerGas,
-      gasLimit: txParams.gasLimit,
-      to: txParams.to,
-      value: txParams.value,
-      data: txParams.data,
-      signature: {
-        r: ethereumSignature.r,
-        s: ethereumSignature.s,
-        v: Number(ethereumSignature.v),
+    const { txHash, receipt } = await submitWithRetry(
+      this.client,
+      txParams,
+      {
+        r: ethereumSignature.r as Hex,
+        s: ethereumSignature.s as Hex,
+        v: ethereumSignature.v,
       },
+      {
+        maxBroadcastAttempts: 3,
+        receiptTimeoutMs: 180_000,
+      },
+    );
+
+    console.log(`[${op}] Receipt received:`, {
+      status: receipt.status,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed?.toString(),
     });
 
-    const txResponse = await retryWithBackoff(() =>
-      this.provider.broadcastTransaction(signedTx.serialized),
-    );
-    const txReceipt = await txResponse.wait(this.config.ethereumConfirmations);
-
-    if (txReceipt?.status !== 1) {
-      throw new Error(
-        `Ethereum transaction failed with status: ${txReceipt?.status}`,
-      );
-    }
-
-    return txResponse.hash;
+    return txHash;
   }
 
-  private async waitForReadResponse(
+  private async waitForRespondBidirectional(
     eventPromises: EventPromises,
-  ): Promise<ReadRespondedEvent> {
+  ): Promise<RespondBidirectionalEvent> {
     const op = this.config.operationName;
 
     // Start a 30s delayed backfill for read event if it hasn't arrived yet
@@ -188,7 +183,7 @@ export class CrossChainOrchestrator {
     }, 30000);
 
     return await this.waitWithTimeout(
-      eventPromises.readRespond,
+      eventPromises.respondBidirectional,
       this.config.eventTimeoutMs,
       `Read response timeout for ${op}`,
     ).finally(() => clearTimeout(readBackfillTimeout));
@@ -206,7 +201,7 @@ export class CrossChainOrchestrator {
     return Promise.race([promise, timeoutPromise]);
   }
 
-  getBridgeContract(): BridgeContract {
-    return this.bridgeContract;
+  getDexContract(): DexContract {
+    return this.dexContract;
   }
 }

@@ -1,10 +1,13 @@
 import { BN } from '@coral-xyz/anchor';
 import { PublicKey } from '@solana/web3.js';
-import { ethers } from 'ethers';
-import { toBytes } from 'viem';
+import { erc20Abi, toBytes, type Hex, type PublicClient } from 'viem';
 
 import type { EvmTransactionRequest } from '@/lib/types/shared.types';
-import { buildErc20TransferTx } from '@/lib/evm/tx-builder';
+import {
+  buildErc20TransferTx,
+  serializeEvmTx,
+  applyContractSafetyReduction,
+} from '@/lib/evm/tx-builder';
 import { initializeRelayerSetup } from '@/lib/utils/relayer-setup';
 import { generateRequestId, evmParamsToProgram } from '@/lib/program/utils';
 import { SERVICE_CONFIG } from '@/lib/constants/service.config';
@@ -14,8 +17,17 @@ import {
   derivePendingDepositPda,
   derivePendingWithdrawalPda,
 } from '@/lib/constants/addresses';
+import { withEmbeddedSigner } from '@/lib/relayer/embedded-signer';
 
 export async function handleDeposit(args: {
+  userAddress: string;
+  erc20Address: string;
+  ethereumAddress: string;
+}) {
+  return withEmbeddedSigner(() => executeDeposit(args));
+}
+
+async function executeDeposit(args: {
   userAddress: string;
   erc20Address: string;
   ethereumAddress: string;
@@ -27,7 +39,7 @@ export async function handleDeposit(args: {
       operationName: 'DEPOSIT',
       eventTimeoutMs: 60000,
     });
-  const bridgeContract = orchestrator.getBridgeContract();
+  const dexContract = orchestrator.getDexContract();
 
   const userPublicKey = new PublicKey(userAddress);
   const [vaultAuthority] = deriveVaultAuthorityPda(userPublicKey);
@@ -41,14 +53,10 @@ export async function handleDeposit(args: {
   );
   if (!actualAmount) return { ok: false, error: 'No token balance detected' };
 
-  const randomReduction = BigInt(Math.floor(Math.random() * 100) + 1);
-  const processAmount =
-    actualAmount > randomReduction
-      ? actualAmount - randomReduction
-      : actualAmount;
+  const processAmount = applyContractSafetyReduction(actualAmount);
 
   const path = userAddress;
-  const erc20AddressBytes = Array.from(toBytes(erc20Address));
+  const erc20AddressBytes = Array.from(toBytes(erc20Address as Hex));
 
   const txRequest: EvmTransactionRequest = await buildErc20TransferTx({
     provider,
@@ -58,11 +66,11 @@ export async function handleDeposit(args: {
     amount: processAmount,
   });
 
-  const rlpEncodedTx = ethers.Transaction.from(txRequest).unsignedSerialized;
+  const rlpEncodedTx = serializeEvmTx(txRequest);
   const requestId = generateRequestId(
     vaultAuthority,
-    ethers.getBytes(rlpEncodedTx),
-    SERVICE_CONFIG.ETHEREUM.SLIP44_COIN_TYPE,
+    toBytes(rlpEncodedTx),
+    SERVICE_CONFIG.ETHEREUM.CAIP2_ID,
     SERVICE_CONFIG.RETRY.DEFAULT_KEY_VERSION,
     path,
     SERVICE_CONFIG.CRYPTOGRAPHY.SIGNATURE_ALGORITHM,
@@ -77,19 +85,20 @@ export async function handleDeposit(args: {
   const result = await orchestrator.executeSignatureFlow(
     requestId,
     txRequest,
-    async (readEvent, ethereumTxHash) => {
+    async (respondBidirectionalEvent, ethereumTxHash) => {
       const [pendingDepositPda] = derivePendingDepositPda(requestIdBytes);
       try {
-        const pendingDeposit =
-          await bridgeContract.fetchPendingDeposit(pendingDepositPda);
+        const pendingDeposit = (await dexContract.fetchPendingDeposit(
+          pendingDepositPda,
+        )) as { requester: PublicKey; erc20Address: number[] };
         const ethereumTxHashBytes = ethereumTxHash
           ? Array.from(toBytes(ethereumTxHash))
           : undefined;
-        return await bridgeContract.claimErc20({
+        return await dexContract.claimErc20({
           requester: pendingDeposit.requester,
           requestIdBytes,
-          serializedOutput: readEvent.serializedOutput,
-          signature: readEvent.signature,
+          serializedOutput: respondBidirectionalEvent.serializedOutput,
+          signature: respondBidirectionalEvent.signature,
           erc20AddressBytes: pendingDeposit.erc20Address,
           ethereumTxHashBytes,
         });
@@ -105,7 +114,7 @@ export async function handleDeposit(args: {
       }
     },
     async () => {
-      return await bridgeContract.depositErc20({
+      return await dexContract.depositErc20({
         requester: userPublicKey,
         payer: relayerWallet.publicKey,
         requestIdBytes,
@@ -133,6 +142,14 @@ export async function handleWithdrawal(args: {
   erc20Address: string;
   transactionParams: EvmTransactionRequest;
 }) {
+  return withEmbeddedSigner(() => executeWithdrawal(args));
+}
+
+async function executeWithdrawal(args: {
+  requestId: string;
+  erc20Address: string;
+  transactionParams: EvmTransactionRequest;
+}) {
   const { requestId, erc20Address, transactionParams } = args;
   const { orchestrator } = await initializeRelayerSetup({
     operationName: 'WITHDRAW',
@@ -142,11 +159,11 @@ export async function handleWithdrawal(args: {
   const result = await orchestrator.executeSignatureFlow(
     requestId,
     transactionParams,
-    async (readEvent, ethereumTxHash) => {
-      const bridgeContract = orchestrator.getBridgeContract();
+    async (respondBidirectionalEvent, ethereumTxHash) => {
+      const dexContract = orchestrator.getDexContract();
       const requestIdBytes = Array.from(toBytes(requestId));
       const [pendingWithdrawalPda] = derivePendingWithdrawalPda(requestIdBytes);
-      const pendingWithdrawal = (await bridgeContract.fetchPendingWithdrawal(
+      const pendingWithdrawal = (await dexContract.fetchPendingWithdrawal(
         pendingWithdrawalPda,
       )) as unknown as { requester: string };
       const erc20AddressBytes = Array.from(toBytes(erc20Address));
@@ -154,11 +171,11 @@ export async function handleWithdrawal(args: {
         ? Array.from(toBytes(ethereumTxHash))
         : undefined;
 
-      return await bridgeContract.completeWithdrawErc20({
+      return await dexContract.completeWithdrawErc20({
         requester: new PublicKey(pendingWithdrawal.requester),
         requestIdBytes,
-        serializedOutput: readEvent.serializedOutput,
-        signature: readEvent.signature,
+        serializedOutput: respondBidirectionalEvent.serializedOutput,
+        signature: respondBidirectionalEvent.signature,
         erc20AddressBytes,
         ethereumTxHashBytes,
       });
@@ -178,18 +195,19 @@ export async function handleWithdrawal(args: {
 async function monitorTokenBalance(
   address: string,
   tokenAddress: string,
-  provider: ethers.JsonRpcProvider,
+  client: PublicClient,
 ): Promise<bigint | null> {
   const deadline = Date.now() + 60_000;
   const intervalMs = 5_000;
-  const erc20Contract = new ethers.Contract(
-    tokenAddress,
-    ['function balanceOf(address owner) view returns (uint256)'],
-    provider,
-  );
+
   while (Date.now() < deadline) {
     try {
-      const balance = await erc20Contract.balanceOf(address);
+      const balance = await client.readContract({
+        address: tokenAddress as Hex,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [address as Hex],
+      });
       if (balance > BigInt(0)) return balance;
     } catch {
       // swallow and retry

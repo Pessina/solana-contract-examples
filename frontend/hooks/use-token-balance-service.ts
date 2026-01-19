@@ -1,19 +1,15 @@
 'use client';
 
-import { useMemo } from 'react';
-
 import { TokenBalanceService } from '@/lib/services/token-balance-service';
 
-import { useBridgeContract } from './use-bridge-contract';
+import { useDexContract } from './use-dex-contract';
 
 export function useTokenBalanceService() {
-  const bridgeContract = useBridgeContract();
+  const dexContract = useDexContract();
 
-  return useMemo(() => {
-    if (!bridgeContract) {
-      return null;
-    }
+  if (!dexContract) {
+    return null;
+  }
 
-    return new TokenBalanceService(bridgeContract);
-  }, [bridgeContract]);
+  return new TokenBalanceService(dexContract);
 }

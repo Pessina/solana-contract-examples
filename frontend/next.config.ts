@@ -1,33 +1,18 @@
 import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  // Disable linting and type checking during builds
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
+  // Enable React Compiler for automatic memoization
+  reactCompiler: true,
+
+  // Skip TypeScript errors during build (use separate tsc check)
   typescript: {
     ignoreBuildErrors: true,
   },
-  // Optimize for development performance
+
   reactStrictMode: true,
 
-  // Configure module transpilation
-  transpilePackages: [
-    '@solana/wallet-adapter-react',
-    '@solana/wallet-adapter-react-ui',
-    '@solana/wallet-adapter-base',
-    '@solana/wallet-adapter-wallets',
-  ],
-
-  // Turbopack configuration (now stable in Next.js 15.3+)
-  turbopack: {
-    rules: {
-      '*.svg': {
-        loaders: ['@svgr/webpack'],
-        as: '*.js',
-      },
-    },
-  },
+  // Server-only packages excluded from bundling (avoid Turbopack conflicts)
+  serverExternalPackages: ['fakenet-signer', 'bitcoin-core'],
 
   // Optimize package imports
   experimental: {

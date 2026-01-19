@@ -6,10 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-solana_core_contracts = "3wgi78Dc9kStc1bV4SmrHQXNerE3Z97yd1rQtDoDq5Xo"
+solana_core_contracts = "DzSqpUpL8DJ1z3wNAFnPMKRPZQL1oEZrwwSnXkA4w8Ce"
 
 [programs.localnet]
-solana_core_contracts = "3wgi78Dc9kStc1bV4SmrHQXNerE3Z97yd1rQtDoDq5Xo"
+solana_core_contracts = "GjU1P2X665JX3kygXqYYttTncfUwwh1akDK2apV13GUf"
 
 [registry]
 url = "https://api.apr.dev"
@@ -19,4 +19,4 @@ cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+test = "NODE_OPTIONS='--import tsx' yarn run mocha --no-warnings --timeout 1000000 --exit 'tests/**/*.ts'"

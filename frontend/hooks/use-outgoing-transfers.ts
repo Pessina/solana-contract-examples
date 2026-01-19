@@ -1,7 +1,6 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 
 import { queryKeys } from '@/lib/query-client';
@@ -9,8 +8,9 @@ import { WithdrawalService } from '@/lib/services/withdrawal-service';
 import { VAULT_ETHEREUM_ADDRESS } from '@/lib/constants/addresses';
 
 import { useWithdrawalService } from './use-withdrawal-service';
+import { useSolanaPublicKey } from './use-solana-public-key';
 
-export interface OutgoingTransfer {
+interface OutgoingTransfer {
   requestId: string;
   transactionHash?: string;
   blockNumber?: bigint;
@@ -24,7 +24,7 @@ export interface OutgoingTransfer {
   status: 'pending' | 'processing' | 'completed' | 'failed';
 }
 
-export interface WithdrawalRequest {
+interface WithdrawalRequest {
   requestId: string;
   erc20Address: string;
   amount: string;
@@ -58,10 +58,10 @@ async function fetchUserWithdrawals(
 }
 
 export function useOutgoingTransfers() {
-  const { publicKey } = useWallet();
   const withdrawalService = useWithdrawalService();
+  const publicKey = useSolanaPublicKey();
 
-  const query = useQuery({
+  return useQuery({
     queryKey: publicKey
       ? queryKeys.solana.outgoingTransfers(publicKey.toString())
       : [],
@@ -93,13 +93,11 @@ export function useOutgoingTransfers() {
     },
     enabled: !!publicKey && !!withdrawalService,
 
-    staleTime: 3 * 1000, // 3 seconds
+    staleTime: 3 * 1000,
     gcTime: 15 * 60 * 1000,
-    refetchInterval: 5 * 1000, // Refetch every 5 seconds
+    refetchInterval: 5 * 1000,
     refetchIntervalInBackground: true,
     retry: 2,
     retryDelay: 1500,
   });
-
-  return query;
 }

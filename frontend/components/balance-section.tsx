@@ -1,22 +1,15 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { Package } from 'lucide-react';
 
-import { Button } from '@/components/ui/button';
 import { BalanceDisplay } from '@/components/balance-display';
 import { EmptyState } from '@/components/states';
-import { DepositDialog } from '@/components/deposit-dialog';
 import { useUserBalances } from '@/hooks';
 import { convertTokenBalancesToDisplayTokens } from '@/lib/utils';
 
 export function BalanceSection() {
   const { data: userBalances = [], isLoading, error } = useUserBalances();
-  const [isDepositDialogOpen, setIsDepositDialogOpen] = useState(false);
-
-  const handleDepositClick = () => {
-    setIsDepositDialogOpen(true);
-  };
 
   const displayTokens = convertTokenBalancesToDisplayTokens(userBalances);
 
@@ -29,13 +22,11 @@ export function BalanceSection() {
   if (isLoading) {
     return (
       <div className='flex w-full max-w-full flex-col gap-5'>
-        {/* Balance section header skeleton */}
         <div className='flex items-center justify-between'>
           <div className='h-6 w-24 animate-pulse rounded bg-gray-200'></div>
           <div className='h-9 w-20 animate-pulse rounded bg-gray-200'></div>
         </div>
 
-        {/* Balance boxes skeleton */}
         <div className='grid w-full max-w-full gap-4 sm:gap-6 md:grid-cols-2 md:gap-5 lg:gap-10'>
           {Array.from({ length: 2 }).map((_, index) => (
             <div
@@ -65,33 +56,14 @@ export function BalanceSection() {
 
   if (displayTokens.length === 0) {
     return (
-      <>
-        <EmptyState
-          icon={Package}
-          title='No tokens found'
-          description='Deposit some tokens to get started managing your portfolio.'
-          compact
-          action={
-            <Button onClick={handleDepositClick} variant='default'>
-              Deposit Tokens
-            </Button>
-          }
-        />
-        <DepositDialog
-          open={isDepositDialogOpen}
-          onOpenChange={setIsDepositDialogOpen}
-        />
-      </>
+      <EmptyState
+        icon={Package}
+        title='No tokens found'
+        description='Deposit some tokens to get started managing your portfolio.'
+        compact
+      />
     );
   }
 
-  return (
-    <>
-      <BalanceDisplay tokens={displayTokens} />
-      <DepositDialog
-        open={isDepositDialogOpen}
-        onOpenChange={setIsDepositDialogOpen}
-      />
-    </>
-  );
+  return <BalanceDisplay tokens={displayTokens} />;
 }

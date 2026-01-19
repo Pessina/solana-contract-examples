@@ -1,15 +1,15 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { useWallet } from '@solana/wallet-adapter-react';
 
 import { queryKeys } from '@/lib/query-client';
 
 import { useTokenBalanceService } from './use-token-balance-service';
+import { useSolanaPublicKey } from './use-solana-public-key';
 
 export function useUserBalances() {
-  const { publicKey } = useWallet();
   const tokenBalanceService = useTokenBalanceService();
+  const publicKey = useSolanaPublicKey();
 
   return useQuery({
     queryKey: publicKey
@@ -22,8 +22,8 @@ export function useUserBalances() {
       return tokenBalanceService.fetchUserBalances(publicKey);
     },
     enabled: !!publicKey && !!tokenBalanceService,
-    staleTime: 3 * 1000, // 3 seconds
-    refetchInterval: 5 * 1000, // Refetch every 5 seconds
+    staleTime: 3 * 1000,
+    refetchInterval: 5 * 1000,
     refetchIntervalInBackground: true,
   });
 }

@@ -1,16 +1,19 @@
 'use client';
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useWallet } from '@solana/connector/react';
 
-import { queryKeys } from '@/lib/query-client';
+import { queryKeys, invalidateWithdrawalQueries } from '@/lib/query-client';
+import type { StatusCallback } from '@/lib/types/shared.types';
 
 import { useWithdrawalService } from './use-withdrawal-service';
+import { useSolanaPublicKey } from './use-solana-public-key';
 
 export function useWithdrawEvmMutation() {
-  const { publicKey } = useWallet();
+  const { account } = useWallet();
   const withdrawalService = useWithdrawalService();
   const queryClient = useQueryClient();
+  const publicKey = useSolanaPublicKey();
 
   return useMutation({
     mutationFn: async ({
@@ -22,12 +25,7 @@ export function useWithdrawEvmMutation() {
       erc20Address: string;
       amount: string;
       recipientAddress: string;
-      onStatusChange?: (status: {
-        status: string;
-        txHash?: string;
-        note?: string;
-        error?: string;
-      }) => void;
+      onStatusChange?: StatusCallback;
     }) => {
       if (!publicKey) throw new Error('No public key available');
       if (!withdrawalService)
@@ -41,16 +39,8 @@ export function useWithdrawEvmMutation() {
       );
     },
     onSuccess: () => {
-      if (publicKey) {
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.userBalances(publicKey.toString()),
-        });
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.unclaimedBalances(publicKey.toString()),
-        });
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.outgoingTransfers(publicKey.toString()),
-        });
+      if (account) {
+        invalidateWithdrawalQueries(queryClient, account);
       }
     },
     onError: (error, variables) => {
@@ -62,9 +52,9 @@ export function useWithdrawEvmMutation() {
         });
       }
 
-      if (publicKey) {
+      if (account) {
         queryClient.invalidateQueries({
-          queryKey: queryKeys.solana.outgoingTransfers(publicKey.toString()),
+          queryKey: queryKeys.solana.outgoingTransfers(account),
         });
       }
     },

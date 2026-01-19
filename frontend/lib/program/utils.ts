@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
-import { ethers } from 'ethers';
 import { BN } from '@coral-xyz/anchor';
+import { encodePacked, keccak256, type Hex } from 'viem';
 
 import type {
   EvmTransactionRequest,
@@ -9,47 +9,26 @@ import type {
 
 /**
  * Generate a request ID matching the Rust implementation
- * This must match exactly with the contract's generate_sign_respond_request_id function
+ * This must match exactly with the contract's generate_sign_bidirectional_request_id function
  */
 export function generateRequestId(
   sender: PublicKey,
   transactionData: Uint8Array,
-  slip44ChainId: number,
+  caip2Id: string,
   keyVersion: number,
   path: string,
   algo: string,
   dest: string,
   params: string,
 ): string {
-  const txDataArray = Array.from(transactionData);
-  const txDataHex = '0x' + Buffer.from(txDataArray).toString('hex');
+  const txDataHex = ('0x' + Buffer.from(transactionData).toString('hex')) as Hex;
 
-  const encoded = ethers.solidityPacked(
-    [
-      'string',
-      'bytes',
-      'uint32',
-      'uint32',
-      'string',
-      'string',
-      'string',
-      'string',
-    ],
-    [
-      sender.toString(),
-      txDataHex,
-      slip44ChainId,
-      keyVersion,
-      path,
-      algo,
-      dest,
-      params,
-    ],
+  const encoded = encodePacked(
+    ['string', 'bytes', 'string', 'uint32', 'string', 'string', 'string', 'string'],
+    [sender.toString(), txDataHex, caip2Id, keyVersion, path, algo, dest, params],
   );
 
-  const hash = ethers.keccak256(encoded);
-
-  return hash;
+  return keccak256(encoded);
 }
 
 /**
