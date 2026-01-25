@@ -32,8 +32,9 @@ const serverEnvSchema = z.object({
       'MPC root key must be 0x-prefixed 64-char hex',
     )
     .optional(),
-  SOLANA_RPC_URL: z.string().url().optional(),
   INFURA_API_KEY: z.string().min(1, 'Infura API key is required'),
+  REDIS_URL: z.string().min(1, 'Redis URL is required'),
+  REDIS_TOKEN: z.string().min(1, 'Redis token is required'),
 });
 
 // Full environment schema (client + server)
@@ -41,7 +42,6 @@ const fullEnvSchema = clientEnvSchema.merge(serverEnvSchema);
 
 // Type exports
 export type ClientEnv = z.infer<typeof clientEnvSchema>;
-export type ServerEnv = z.infer<typeof serverEnvSchema>;
 export type FullEnv = z.infer<typeof fullEnvSchema>;
 
 /**
@@ -97,8 +97,11 @@ export function getFullEnv(): FullEnv {
       process.env.NEXT_PUBLIC_MPC_ROOT_PUBLIC_KEY,
     RELAYER_PRIVATE_KEY: process.env.RELAYER_PRIVATE_KEY,
     MPC_ROOT_KEY: process.env.MPC_ROOT_KEY,
-    SOLANA_RPC_URL: process.env.SOLANA_RPC_URL,
     INFURA_API_KEY: process.env.INFURA_API_KEY,
+    REDIS_URL:
+      process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL,
+    REDIS_TOKEN:
+      process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN,
   };
 
   try {

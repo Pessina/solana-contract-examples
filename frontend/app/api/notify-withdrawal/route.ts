@@ -2,6 +2,7 @@ import { after } from 'next/server';
 import { NextRequest, NextResponse } from 'next/server';
 
 import { handleWithdrawal } from '@/lib/relayer/handlers';
+import { registerTx } from '@/lib/relayer/tx-registry';
 import type {
   EvmTransactionRequest,
   EvmTransactionRequestNotifyWithdrawal,
@@ -30,14 +31,32 @@ function parseTransactionParams(
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { requestId, erc20Address, transactionParams } = body;
+    const {
+      requestId,
+      erc20Address,
+      transactionParams,
+      userAddress,
+      recipientAddress,
+      tokenAmount,
+      tokenDecimals,
+      tokenSymbol,
+    } = body;
 
-    if (!requestId || !erc20Address || !transactionParams) {
+    if (!requestId || !erc20Address || !transactionParams || !userAddress) {
       return NextResponse.json(
         { error: 'Missing required fields' },
         { status: 400 },
       );
     }
+
+    // Register in KV before background processing
+    // For withdrawals, store the recipient Ethereum wallet address
+    await registerTx(requestId, 'withdrawal', userAddress, recipientAddress, {
+      tokenMint: erc20Address,
+      tokenAmount,
+      tokenDecimals,
+      tokenSymbol,
+    });
 
     after(async () => {
       try {

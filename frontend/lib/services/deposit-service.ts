@@ -8,6 +8,11 @@ import { notifyDeposit } from '@/lib/services/relayer-service';
 import type { StatusCallback } from '@/lib/types/shared.types';
 import { CHAIN_SIGNATURES_CONFIG } from '@/lib/constants/addresses';
 
+export interface DepositResult {
+  derivedAddress: string;
+  trackingId: string;
+}
+
 /**
  * DepositService shows users where to deposit ERC20 tokens on Ethereum.
  * The relayer monitors Ethereum and handles Solana bridge calls automatically.
@@ -20,9 +25,10 @@ export class DepositService {
     publicKey: PublicKey,
     erc20Address: string,
     amount: string,
-    _decimals = 6,
+    decimals = 6,
+    tokenSymbol?: string,
     onStatusChange?: StatusCallback,
-  ): Promise<string> {
+  ): Promise<DepositResult> {
     try {
       const [vaultAuthority] = deriveVaultAuthorityPda(publicKey);
       const path = publicKey.toString();
@@ -33,10 +39,12 @@ export class DepositService {
       );
 
       // Notify relayer to monitor for this deposit
-      await notifyDeposit({
+      const response = await notifyDeposit({
         userAddress: publicKey.toString(),
         erc20Address,
         ethereumAddress: derivedAddress,
+        tokenDecimals: decimals,
+        tokenSymbol,
       });
 
       onStatusChange?.({
@@ -44,8 +52,10 @@ export class DepositService {
         note: `Deposit ${amount} tokens to: ${derivedAddress}. Relayer will handle the bridge process.`,
       });
 
-      // Return the derived address as the "request ID" for tracking
-      return derivedAddress;
+      return {
+        derivedAddress,
+        trackingId: response.trackingId,
+      };
     } catch (error) {
       console.error('Deposit ERC20 failed:', error);
       throw new Error(

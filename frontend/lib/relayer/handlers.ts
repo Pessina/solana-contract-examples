@@ -8,6 +8,10 @@ import {
   serializeEvmTx,
   applyContractSafetyReduction,
 } from '@/lib/evm/tx-builder';
+import {
+  ensureGasForErc20Transfer,
+  ensureGasForTransaction,
+} from '@/lib/evm/gas-topup';
 import { initializeRelayerSetup } from '@/lib/utils/relayer-setup';
 import { generateRequestId, evmParamsToProgram } from '@/lib/program/utils';
 import { SERVICE_CONFIG } from '@/lib/constants/service.config';
@@ -18,11 +22,14 @@ import {
   derivePendingWithdrawalPda,
 } from '@/lib/constants/addresses';
 import { withEmbeddedSigner } from '@/lib/relayer/embedded-signer';
+import { updateTxStatus } from '@/lib/relayer/tx-registry';
+import { fetchErc20Decimals, getErc20Token } from '@/lib/constants/token-metadata';
 
 export async function handleDeposit(args: {
   userAddress: string;
   erc20Address: string;
   ethereumAddress: string;
+  trackingId: string;
 }) {
   return withEmbeddedSigner(() => executeDeposit(args));
 }
@@ -31,110 +38,184 @@ async function executeDeposit(args: {
   userAddress: string;
   erc20Address: string;
   ethereumAddress: string;
+  trackingId: string;
 }) {
-  const { userAddress, erc20Address, ethereumAddress } = args;
+  const { userAddress, erc20Address, ethereumAddress, trackingId } = args;
 
-  const { orchestrator, provider, relayerWallet } =
-    await initializeRelayerSetup({
-      operationName: 'DEPOSIT',
-      eventTimeoutMs: 60000,
-    });
-  const dexContract = orchestrator.getDexContract();
-
-  const userPublicKey = new PublicKey(userAddress);
-  const [vaultAuthority] = deriveVaultAuthorityPda(userPublicKey);
-
-  await new Promise(resolve => setTimeout(resolve, 12000));
-
-  const actualAmount = await monitorTokenBalance(
-    ethereumAddress,
-    erc20Address,
-    provider,
-  );
-  if (!actualAmount) return { ok: false, error: 'No token balance detected' };
-
-  const processAmount = applyContractSafetyReduction(actualAmount);
-
-  const path = userAddress;
-  const erc20AddressBytes = Array.from(toBytes(erc20Address as Hex));
-
-  const txRequest: EvmTransactionRequest = await buildErc20TransferTx({
-    provider,
-    from: ethereumAddress,
-    erc20Address,
-    recipient: VAULT_ETHEREUM_ADDRESS,
-    amount: processAmount,
-  });
-
-  const rlpEncodedTx = serializeEvmTx(txRequest);
-  const requestId = generateRequestId(
-    vaultAuthority,
-    toBytes(rlpEncodedTx),
-    SERVICE_CONFIG.ETHEREUM.CAIP2_ID,
-    SERVICE_CONFIG.RETRY.DEFAULT_KEY_VERSION,
-    path,
-    SERVICE_CONFIG.CRYPTOGRAPHY.SIGNATURE_ALGORITHM,
-    SERVICE_CONFIG.CRYPTOGRAPHY.TARGET_BLOCKCHAIN,
-    '',
-  );
-
-  const requestIdBytes = Array.from(toBytes(requestId));
-  const evmParams = evmParamsToProgram(txRequest);
-  const amountBN = new BN(processAmount.toString());
-
-  const result = await orchestrator.executeSignatureFlow(
-    requestId,
-    txRequest,
-    async (respondBidirectionalEvent, ethereumTxHash) => {
-      const [pendingDepositPda] = derivePendingDepositPda(requestIdBytes);
-      try {
-        const pendingDeposit = (await dexContract.fetchPendingDeposit(
-          pendingDepositPda,
-        )) as { requester: PublicKey; erc20Address: number[] };
-        const ethereumTxHashBytes = ethereumTxHash
-          ? Array.from(toBytes(ethereumTxHash))
-          : undefined;
-        return await dexContract.claimErc20({
-          requester: pendingDeposit.requester,
-          requestIdBytes,
-          serializedOutput: respondBidirectionalEvent.serializedOutput,
-          signature: respondBidirectionalEvent.signature,
-          erc20AddressBytes: pendingDeposit.erc20Address,
-          ethereumTxHashBytes,
-        });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (
-          msg.includes('Account does not exist') ||
-          msg.includes('AccountNotFound')
-        ) {
-          return 'already-claimed';
-        }
-        throw e;
-      }
-    },
-    async () => {
-      return await dexContract.depositErc20({
-        requester: userPublicKey,
-        payer: relayerWallet.publicKey,
-        requestIdBytes,
-        erc20AddressBytes,
-        recipientAddressBytes: Array.from(toBytes(VAULT_ETHEREUM_ADDRESS)),
-        amount: amountBN,
-        evmParams,
+  try {
+    const { orchestrator, provider, relayerWallet } =
+      await initializeRelayerSetup({
+        operationName: 'DEPOSIT',
+        eventTimeoutMs: 60000,
       });
-    },
-  );
+    const dexContract = orchestrator.getDexContract();
 
-  if (!result.success)
-    return { ok: false, error: result.error ?? 'Deposit failed' };
-  return {
-    ok: true as const,
-    requestId,
-    initialSolanaTxHash: result.initialSolanaTxHash,
-    ethereumTxHash: result.ethereumTxHash,
-    claimTx: result.solanaResult,
-  };
+    const userPublicKey = new PublicKey(userAddress);
+    const [vaultAuthority] = deriveVaultAuthorityPda(userPublicKey);
+
+    // Phase 1: Balance polling
+    await updateTxStatus(trackingId, 'balance_polling');
+
+    const actualAmount = await monitorTokenBalance(
+      ethereumAddress,
+      erc20Address,
+      provider,
+    );
+    if (!actualAmount) {
+      const balanceError = `No token balance detected at ${ethereumAddress} for token ${erc20Address} after 5 minutes`;
+      await updateTxStatus(trackingId, 'failed', {
+        error: balanceError,
+      });
+      return { ok: false, error: balanceError };
+    }
+
+    const processAmount = applyContractSafetyReduction(actualAmount);
+
+    // Fetch decimals from chain (throws if token not in allowlist)
+    const decimals = await fetchErc20Decimals(erc20Address);
+    const tokenMetadata = getErc20Token(erc20Address);
+
+    // Phase 1.5: Gas top-up if needed
+    const { topUpTxHash } = await ensureGasForErc20Transfer(
+      provider,
+      ethereumAddress as Hex,
+      erc20Address as Hex,
+      VAULT_ETHEREUM_ADDRESS,
+      processAmount,
+    );
+    if (topUpTxHash) {
+      console.log(`[DEPOSIT] Gas top-up sent: ${topUpTxHash}`);
+      await updateTxStatus(trackingId, 'gas_topup_pending', {
+        gasTopUpTxHash: topUpTxHash,
+      });
+    }
+
+    const path = userAddress;
+    const erc20AddressBytes = Array.from(toBytes(erc20Address as Hex));
+
+    const txRequest: EvmTransactionRequest = await buildErc20TransferTx({
+      provider,
+      from: ethereumAddress,
+      erc20Address,
+      recipient: VAULT_ETHEREUM_ADDRESS,
+      amount: processAmount,
+    });
+
+    const rlpEncodedTx = serializeEvmTx(txRequest);
+    const requestId = generateRequestId(
+      vaultAuthority,
+      toBytes(rlpEncodedTx),
+      SERVICE_CONFIG.ETHEREUM.CAIP2_ID,
+      SERVICE_CONFIG.RETRY.DEFAULT_KEY_VERSION,
+      path,
+      SERVICE_CONFIG.CRYPTOGRAPHY.SIGNATURE_ALGORITHM,
+      SERVICE_CONFIG.CRYPTOGRAPHY.TARGET_BLOCKCHAIN,
+      '',
+    );
+
+    const requestIdBytes = Array.from(toBytes(requestId));
+    const evmParams = evmParamsToProgram(txRequest);
+    const amountBN = new BN(processAmount.toString());
+
+    // Phase 2: Solana pending - link requestId and store token info
+    await updateTxStatus(trackingId, 'solana_pending', {
+      requestId,
+      tokenMint: erc20Address,
+      tokenAmount: processAmount.toString(),
+      tokenDecimals: decimals,
+      tokenSymbol: tokenMetadata?.symbol ?? 'Unknown',
+    });
+
+    const result = await orchestrator.executeSignatureFlow(
+      requestId,
+      txRequest,
+      async (respondBidirectionalEvent, ethereumTxHash) => {
+        const [pendingDepositPda] = derivePendingDepositPda(requestIdBytes);
+        try {
+          const pendingDeposit = (await dexContract.fetchPendingDeposit(
+            pendingDepositPda,
+          )) as { requester: PublicKey; erc20Address: number[] };
+          const ethereumTxHashBytes = ethereumTxHash
+            ? Array.from(toBytes(ethereumTxHash))
+            : undefined;
+
+          // Phase 5: Completing
+          await updateTxStatus(trackingId, 'completing', { ethereumTxHash });
+
+          return await dexContract.claimErc20({
+            requester: pendingDeposit.requester,
+            requestIdBytes,
+            serializedOutput: respondBidirectionalEvent.serializedOutput,
+            signature: respondBidirectionalEvent.signature,
+            erc20AddressBytes: pendingDeposit.erc20Address,
+            ethereumTxHashBytes,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (
+            msg.includes('Account does not exist') ||
+            msg.includes('AccountNotFound')
+          ) {
+            return 'already-claimed';
+          }
+          throw e;
+        }
+      },
+      async () => {
+        const tx = await dexContract.depositErc20({
+          requester: userPublicKey,
+          payer: relayerWallet.publicKey,
+          requestIdBytes,
+          erc20AddressBytes,
+          recipientAddressBytes: Array.from(toBytes(VAULT_ETHEREUM_ADDRESS)),
+          amount: amountBN,
+          evmParams,
+        });
+
+        // Phase 3: Signature pending
+        await updateTxStatus(trackingId, 'signature_pending', {
+          solanaInitTxHash: tx,
+        });
+
+        return tx;
+      },
+      // onEthereumPending callback
+      async () => {
+        // Phase 4: Ethereum pending
+        await updateTxStatus(trackingId, 'ethereum_pending');
+      },
+    );
+
+    if (!result.success) {
+      const depositError = result.error ?? `Deposit flow failed for request ${trackingId}`;
+      await updateTxStatus(trackingId, 'failed', {
+        error: depositError,
+      });
+      return { ok: false, error: depositError };
+    }
+
+    // Phase 6: Completed
+    await updateTxStatus(trackingId, 'completed', {
+      ethereumTxHash: result.ethereumTxHash,
+      solanaFinalizeTxHash: result.solanaResult,
+    });
+
+    return {
+      ok: true as const,
+      requestId,
+      initialSolanaTxHash: result.initialSolanaTxHash,
+      ethereumTxHash: result.ethereumTxHash,
+      claimTx: result.solanaResult,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error
+      ? error.message
+      : `Unexpected error during deposit: ${String(error)}`;
+    await updateTxStatus(trackingId, 'failed', {
+      error: errorMessage,
+    });
+    throw error;
+  }
 }
 
 export async function handleWithdrawal(args: {
@@ -151,54 +232,239 @@ async function executeWithdrawal(args: {
   transactionParams: EvmTransactionRequest;
 }) {
   const { requestId, erc20Address, transactionParams } = args;
-  const { orchestrator } = await initializeRelayerSetup({
-    operationName: 'WITHDRAW',
-    eventTimeoutMs: 60000,
-  });
 
-  const result = await orchestrator.executeSignatureFlow(
-    requestId,
-    transactionParams,
-    async (respondBidirectionalEvent, ethereumTxHash) => {
-      const dexContract = orchestrator.getDexContract();
-      const requestIdBytes = Array.from(toBytes(requestId));
-      const [pendingWithdrawalPda] = derivePendingWithdrawalPda(requestIdBytes);
-      const pendingWithdrawal = (await dexContract.fetchPendingWithdrawal(
-        pendingWithdrawalPda,
-      )) as unknown as { requester: string };
-      const erc20AddressBytes = Array.from(toBytes(erc20Address));
-      const ethereumTxHashBytes = ethereumTxHash
-        ? Array.from(toBytes(ethereumTxHash))
-        : undefined;
+  try {
+    const { orchestrator, provider } = await initializeRelayerSetup({
+      operationName: 'WITHDRAW',
+      eventTimeoutMs: 60000,
+    });
 
-      return await dexContract.completeWithdrawErc20({
-        requester: new PublicKey(pendingWithdrawal.requester),
-        requestIdBytes,
-        serializedOutput: respondBidirectionalEvent.serializedOutput,
-        signature: respondBidirectionalEvent.signature,
-        erc20AddressBytes,
-        ethereumTxHashBytes,
+    // Phase: Gas top-up for vault if needed
+    const { topUpTxHash } = await ensureGasForTransaction(
+      provider,
+      VAULT_ETHEREUM_ADDRESS,
+      transactionParams.gasLimit,
+      transactionParams.maxFeePerGas,
+    );
+    if (topUpTxHash) {
+      console.log(`[WITHDRAW] Gas top-up sent: ${topUpTxHash}`);
+      await updateTxStatus(requestId, 'gas_topup_pending', {
+        gasTopUpTxHash: topUpTxHash,
       });
-    },
-  );
+    }
 
-  if (!result.success)
-    return { ok: false, error: result.error ?? 'Withdrawal failed' };
-  return {
-    ok: true as const,
-    requestId,
-    ethereumTxHash: result.ethereumTxHash,
-    solanaTx: result.solanaResult,
-  };
+    // Update status to signature_pending
+    await updateTxStatus(requestId, 'signature_pending');
+
+    const result = await orchestrator.executeSignatureFlow(
+      requestId,
+      transactionParams,
+      async (respondBidirectionalEvent, ethereumTxHash) => {
+        const dexContract = orchestrator.getDexContract();
+        const requestIdBytes = Array.from(toBytes(requestId));
+        const [pendingWithdrawalPda] =
+          derivePendingWithdrawalPda(requestIdBytes);
+        const pendingWithdrawal = (await dexContract.fetchPendingWithdrawal(
+          pendingWithdrawalPda,
+        )) as unknown as { requester: string };
+        const erc20AddressBytes = Array.from(toBytes(erc20Address));
+        const ethereumTxHashBytes = ethereumTxHash
+          ? Array.from(toBytes(ethereumTxHash))
+          : undefined;
+
+        // Phase: Completing
+        await updateTxStatus(requestId, 'completing', { ethereumTxHash });
+
+        return await dexContract.completeWithdrawErc20({
+          requester: new PublicKey(pendingWithdrawal.requester),
+          requestIdBytes,
+          serializedOutput: respondBidirectionalEvent.serializedOutput,
+          signature: respondBidirectionalEvent.signature,
+          erc20AddressBytes,
+          ethereumTxHashBytes,
+        });
+      },
+      undefined,
+      // onEthereumPending callback
+      async () => {
+        await updateTxStatus(requestId, 'ethereum_pending');
+      },
+    );
+
+    if (!result.success) {
+      const withdrawalError = result.error ?? `Withdrawal flow failed for request ${requestId}`;
+      await updateTxStatus(requestId, 'failed', {
+        error: withdrawalError,
+      });
+      return { ok: false, error: withdrawalError };
+    }
+
+    await updateTxStatus(requestId, 'completed', {
+      ethereumTxHash: result.ethereumTxHash,
+      solanaFinalizeTxHash: result.solanaResult,
+    });
+
+    return {
+      ok: true as const,
+      requestId,
+      ethereumTxHash: result.ethereumTxHash,
+      solanaTx: result.solanaResult,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error
+      ? error.message
+      : `Unexpected error during withdrawal: ${String(error)}`;
+    await updateTxStatus(requestId, 'failed', {
+      error: errorMessage,
+    });
+    throw error;
+  }
 }
 
+// Recovery functions for stuck transactions
+export async function recoverDeposit(
+  requestId: string,
+  pendingDeposit: { requester: PublicKey; erc20Address: number[] },
+): Promise<{ ok: boolean; error?: string; solanaTx?: string }> {
+  try {
+    await updateTxStatus(requestId, 'signature_pending');
+
+    const { orchestrator } = await initializeRelayerSetup({
+      operationName: 'RECOVER_DEPOSIT',
+      eventTimeoutMs: 60000,
+    });
+    const dexContract = orchestrator.getDexContract();
+    const requestIdBytes = Array.from(toBytes(requestId));
+
+    // For recovery, we only need to complete the claim step
+    // The signature event should still be available if the original tx succeeded
+    const result = await orchestrator.recoverSignatureFlow(
+      requestId,
+      async (respondBidirectionalEvent, ethereumTxHash) => {
+        await updateTxStatus(requestId, 'completing', { ethereumTxHash });
+
+        const ethereumTxHashBytes = ethereumTxHash
+          ? Array.from(toBytes(ethereumTxHash))
+          : undefined;
+
+        return await dexContract.claimErc20({
+          requester: pendingDeposit.requester,
+          requestIdBytes,
+          serializedOutput: respondBidirectionalEvent.serializedOutput,
+          signature: respondBidirectionalEvent.signature,
+          erc20AddressBytes: pendingDeposit.erc20Address,
+          ethereumTxHashBytes,
+        });
+      },
+    );
+
+    if (!result.success) {
+      const recoveryError = result.error ?? `Deposit recovery failed: no signature event found for ${requestId}`;
+      await updateTxStatus(requestId, 'failed', {
+        error: recoveryError,
+      });
+      return { ok: false, error: recoveryError };
+    }
+
+    await updateTxStatus(requestId, 'completed', {
+      solanaFinalizeTxHash: result.solanaResult,
+    });
+
+    return { ok: true, solanaTx: result.solanaResult };
+  } catch (error) {
+    const errorMessage = error instanceof Error
+      ? error.message
+      : `Unexpected error during deposit recovery: ${String(error)}`;
+    await updateTxStatus(requestId, 'failed', {
+      error: errorMessage,
+    });
+    return {
+      ok: false,
+      error: errorMessage,
+    };
+  }
+}
+
+export async function recoverWithdrawal(
+  requestId: string,
+  pendingWithdrawal: { requester: string },
+  erc20Address: string,
+): Promise<{ ok: boolean; error?: string; solanaTx?: string }> {
+  try {
+    await updateTxStatus(requestId, 'signature_pending');
+
+    const { orchestrator } = await initializeRelayerSetup({
+      operationName: 'RECOVER_WITHDRAWAL',
+      eventTimeoutMs: 60000,
+    });
+    const dexContract = orchestrator.getDexContract();
+    const requestIdBytes = Array.from(toBytes(requestId));
+    const erc20AddressBytes = Array.from(toBytes(erc20Address));
+
+    const result = await orchestrator.recoverSignatureFlow(
+      requestId,
+      async (respondBidirectionalEvent, ethereumTxHash) => {
+        await updateTxStatus(requestId, 'completing', { ethereumTxHash });
+
+        const ethereumTxHashBytes = ethereumTxHash
+          ? Array.from(toBytes(ethereumTxHash))
+          : undefined;
+
+        return await dexContract.completeWithdrawErc20({
+          requester: new PublicKey(pendingWithdrawal.requester),
+          requestIdBytes,
+          serializedOutput: respondBidirectionalEvent.serializedOutput,
+          signature: respondBidirectionalEvent.signature,
+          erc20AddressBytes,
+          ethereumTxHashBytes,
+        });
+      },
+    );
+
+    if (!result.success) {
+      const recoveryError = result.error ?? `Withdrawal recovery failed: no signature event found for ${requestId}`;
+      await updateTxStatus(requestId, 'failed', {
+        error: recoveryError,
+      });
+      return { ok: false, error: recoveryError };
+    }
+
+    await updateTxStatus(requestId, 'completed', {
+      solanaFinalizeTxHash: result.solanaResult,
+    });
+
+    return { ok: true, solanaTx: result.solanaResult };
+  } catch (error) {
+    const errorMessage = error instanceof Error
+      ? error.message
+      : `Unexpected error during withdrawal recovery: ${String(error)}`;
+    await updateTxStatus(requestId, 'failed', {
+      error: errorMessage,
+    });
+    return {
+      ok: false,
+      error: errorMessage,
+    };
+  }
+}
+
+// Enhanced balance monitoring with exponential backoff
 async function monitorTokenBalance(
   address: string,
   tokenAddress: string,
   client: PublicClient,
 ): Promise<bigint | null> {
-  const deadline = Date.now() + 60_000;
-  const intervalMs = 5_000;
+  const config = {
+    maxDurationMs: 300_000, // 5 minutes total
+    pollIntervalMs: 5_000, // Check every 5s
+    backoffMultiplier: 1.2, // Increase interval on consecutive failures
+    maxIntervalMs: 30_000, // Cap at 30s between checks
+  };
+
+  let intervalMs = config.pollIntervalMs;
+  const deadline = Date.now() + config.maxDurationMs;
+
+  let lastError: Error | null = null;
 
   while (Date.now() < deadline) {
     try {
@@ -208,11 +474,24 @@ async function monitorTokenBalance(
         functionName: 'balanceOf',
         args: [address as Hex],
       });
-      if (balance > BigInt(0)) return balance;
-    } catch {
-      // swallow and retry
+      if (balance > 0n) return balance;
+      lastError = null; // Reset on successful read
+    } catch (error) {
+      // Log once per unique error to help debugging without flooding logs
+      const currentError = error instanceof Error ? error : new Error(String(error));
+      if (!lastError || lastError.message !== currentError.message) {
+        console.warn(`[BalanceMonitor] RPC error for ${address}: ${currentError.message}`);
+        lastError = currentError;
+      }
     }
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
+
+    await sleep(intervalMs);
+    intervalMs = Math.min(intervalMs * config.backoffMultiplier, config.maxIntervalMs);
   }
+
   return null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
