@@ -73,6 +73,7 @@ async function executeDeposit(args: {
       });
       return { ok: false, error: balanceError };
     }
+    console.log(`[DEPOSIT] Token balance detected: ${actualAmount.toString()}`);
 
     const processAmount = applyContractSafetyReduction(actualAmount);
 
@@ -119,6 +120,9 @@ async function executeDeposit(args: {
     );
 
     const requestIdBytes = Array.from(toBytes(requestId));
+    const [pendingDepositPda] = derivePendingDepositPda(requestIdBytes);
+    console.log(`[DEPOSIT] RequestId: ${requestId}, PDA: ${pendingDepositPda.toBase58()}`);
+
     const evmParams = evmParamsToProgram(txRequest);
     const amountBN = new BN(processAmount.toString());
 
@@ -136,10 +140,12 @@ async function executeDeposit(args: {
       txRequest,
       async (respondBidirectionalData, ethereumTxHash) => {
         const [pendingDepositPda] = derivePendingDepositPda(requestIdBytes);
+        console.log(`[DEPOSIT] Attempting to claim. PDA: ${pendingDepositPda.toBase58()}, RequestID: ${requestId}`);
         try {
           const pendingDeposit = (await dexContract.fetchPendingDeposit(
             pendingDepositPda,
           )) as { requester: PublicKey; erc20Address: number[] };
+          console.log(`[DEPOSIT] Found PendingDeposit. Requester: ${pendingDeposit.requester.toBase58()}`);
           const ethereumTxHashBytes = ethereumTxHash
             ? Array.from(toBytes(ethereumTxHash))
             : undefined;
@@ -147,7 +153,7 @@ async function executeDeposit(args: {
           // Phase 5: Completing
           await updateTxStatus(trackingId, 'completing', { ethereumTxHash });
 
-          return await dexContract.claimErc20({
+          const claimTxHash = await dexContract.claimErc20({
             requester: pendingDeposit.requester,
             requestIdBytes,
             serializedOutput: respondBidirectionalData.serializedOutput,
@@ -155,13 +161,20 @@ async function executeDeposit(args: {
             erc20AddressBytes: pendingDeposit.erc20Address,
             ethereumTxHashBytes,
           });
+          console.log(`[DEPOSIT] Claim successful! Tx: ${claimTxHash}`);
+          return claimTxHash;
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
+          console.error(`[DEPOSIT] Claim error: ${msg}`);
           if (
             msg.includes('Account does not exist') ||
             msg.includes('AccountNotFound')
           ) {
-            return 'already-claimed';
+            throw new Error(
+              `PendingDeposit not found for request ${requestId}. ` +
+              `PDA: ${pendingDepositPda.toBase58()}. ` +
+              `The deposit may have already been claimed or the initial deposit transaction failed.`
+            );
           }
           throw e;
         }
@@ -227,6 +240,9 @@ export async function handleWithdrawal(args: {
   requestId: string;
   erc20Address: string;
   transactionParams: EvmTransactionRequest;
+  solanaInitTxHash?: string;
+  blockhash?: string;
+  lastValidBlockHeight?: number;
 }) {
   return withEmbeddedSigner(() => executeWithdrawal(args));
 }
@@ -235,14 +251,32 @@ async function executeWithdrawal(args: {
   requestId: string;
   erc20Address: string;
   transactionParams: EvmTransactionRequest;
+  solanaInitTxHash?: string;
+  blockhash?: string;
+  lastValidBlockHeight?: number;
 }) {
-  const { requestId, erc20Address, transactionParams } = args;
+  const { requestId, erc20Address, transactionParams, solanaInitTxHash, blockhash, lastValidBlockHeight } = args;
 
   try {
     const { orchestrator, provider } = await initializeRelayerSetup({
       operationName: 'WITHDRAW',
       eventTimeoutMs: 300000,
     });
+    const dexContract = orchestrator.getDexContract();
+
+    // Phase: Confirm Solana tx if we have the blockhash info
+    if (solanaInitTxHash && blockhash && lastValidBlockHeight) {
+      console.log(`[WITHDRAW] Confirming Solana tx: ${solanaInitTxHash}`);
+      await updateTxStatus(requestId, 'solana_pending', { solanaInitTxHash });
+
+      await dexContract.confirmTransactionOrThrow(
+        solanaInitTxHash,
+        blockhash,
+        lastValidBlockHeight,
+        'WITHDRAW',
+      );
+      console.log(`[WITHDRAW] Solana tx confirmed: ${solanaInitTxHash}`);
+    }
 
     // Phase: Gas top-up for vault if needed
     const { topUpTxHash } = await ensureGasForTransaction(
@@ -269,9 +303,31 @@ async function executeWithdrawal(args: {
         const requestIdBytes = Array.from(toBytes(requestId));
         const [pendingWithdrawalPda] =
           derivePendingWithdrawalPda(requestIdBytes);
-        const pendingWithdrawal = (await dexContract.fetchPendingWithdrawal(
-          pendingWithdrawalPda,
-        )) as unknown as { requester: string };
+
+        console.log(`[WITHDRAW] Attempting to complete. PDA: ${pendingWithdrawalPda.toBase58()}, RequestID: ${requestId}`);
+
+        let pendingWithdrawal: { requester: string };
+        try {
+          pendingWithdrawal = (await dexContract.fetchPendingWithdrawal(
+            pendingWithdrawalPda,
+          )) as unknown as { requester: string };
+          console.log(`[WITHDRAW] Found PendingWithdrawal. Requester: ${pendingWithdrawal.requester}`);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error(`[WITHDRAW] Failed to fetch PendingWithdrawal: ${msg}`);
+          if (
+            msg.includes('Account does not exist') ||
+            msg.includes('AccountNotFound')
+          ) {
+            throw new Error(
+              `PendingWithdrawal not found for request ${requestId}. ` +
+              `PDA: ${pendingWithdrawalPda.toBase58()}. ` +
+              `The withdrawal may have already been completed or the initial withdrawal transaction failed.`
+            );
+          }
+          throw e;
+        }
+
         const erc20AddressBytes = Array.from(toBytes(erc20Address));
         const ethereumTxHashBytes = ethereumTxHash
           ? Array.from(toBytes(ethereumTxHash))
@@ -280,7 +336,7 @@ async function executeWithdrawal(args: {
         // Phase: Completing
         await updateTxStatus(requestId, 'completing', { ethereumTxHash });
 
-        return await dexContract.completeWithdrawErc20({
+        const completeTxHash = await dexContract.completeWithdrawErc20({
           requester: new PublicKey(pendingWithdrawal.requester),
           requestIdBytes,
           serializedOutput: respondBidirectionalData.serializedOutput,
@@ -288,6 +344,8 @@ async function executeWithdrawal(args: {
           erc20AddressBytes,
           ethereumTxHashBytes,
         });
+        console.log(`[WITHDRAW] Complete successful! Tx: ${completeTxHash}`);
+        return completeTxHash;
       },
       undefined,
       // onEthereumPending callback
