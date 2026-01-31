@@ -1,9 +1,10 @@
 'use client';
 
 import { useState } from 'react';
+import { toast } from 'sonner';
 
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
-import { LoadingState } from '@/components/states';
+import { LoadingState } from '@/components/states/LoadingState';
 import { useWithdrawEvmMutation, useWithdrawSolMutation } from '@/hooks';
 
 import { AmountInput } from './amount-input';
@@ -64,7 +65,9 @@ function WithdrawDialogContent({
 
       onClose();
     } catch (err) {
-      console.error('Withdrawal failed:', err);
+      toast.error('Withdrawal failed', {
+        description: err instanceof Error ? err.message : 'Unknown error',
+      });
       setIsProcessing(false);
     }
   };
